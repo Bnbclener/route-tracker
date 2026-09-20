@@ -108,6 +108,9 @@ export function buildTourFromTraccar({ dateStr, deviceId, deviceName, stops, tri
       duration: typeof s.duration === 'number' ? s.duration : departureTime - arrivalTime,
       type: classified.type,
       address: classified.address,
+      ambiguousWith: classified.candidates && classified.candidates.length > 1
+        ? classified.candidates.slice(1).map(a => a.name)
+        : null,
       traccarAddress: s.address || null,
       traccarKey: `${s.deviceId}_${s.startTime}`
     };

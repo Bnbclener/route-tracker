@@ -68,6 +68,9 @@ function tourFromStops(rawStops, classify, meta) {
       duration: s.duration,
       type: c.type,
       address: c.address,
+      ambiguousWith: c.candidates && c.candidates.length > 1
+        ? c.candidates.slice(1).map(a => a.name)
+        : null,
       traccarAddress: s.traccarAddress || null
     };
   });

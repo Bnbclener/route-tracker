@@ -193,7 +193,8 @@ export class RouteLearner {
         if (stop.duration > 0) {
           this.manualCorrectSiteTime(stopId(stop), stop.duration, stop.arrivalTime);
         }
-      } else {
+      } else if (!stop.ambiguousWith) {
+        // Plusieurs logements dans le même immeuble : le GPS ne dit pas lequel, durée non apprise.
         this.learnSiteTime(stop);
       }
     }
