@@ -81,14 +81,99 @@ function tag(source, count) {
   return `<span class="tag ${esc(source)}">${esc(label)}${suffix}</span>`;
 }
 
+async function getDaySelection() {
+  const saved = await storage.getSetting('daySelection');
+  return saved && saved.date === todayLocal() ? saved.ids : [];
+}
+
+async function setDaySelection(ids) {
+  await storage.setSetting('daySelection', { date: todayLocal(), ids });
+}
+
 async function loadContext() {
   const addresses = await storage.getAddresses();
   const home = await storage.getSetting('home');
+  const selection = (await getDaySelection()).filter(id => addresses.some(a => a.id === id));
   matcher.setAddresses(addresses);
+  matcher.setPreferred(selection);
   if (home) matcher.setHome(home);
   const savedModel = await storage.getModel();
   if (savedModel) learner.importModel(savedModel);
-  return { addresses, home };
+  return { addresses, home, selection };
+}
+
+function byName(a, b) {
+  return a.name.localeCompare(b.name, 'fr', { sensitivity: 'base', numeric: true });
+}
+
+function matchesQuery(addr, q) {
+  if (!q) return true;
+  const hay = `${addr.name} ${addr.address || ''}`.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  return hay.includes(q.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''));
+}
+
+/** Fenêtre de sélection de logements (recherche + cases à cocher). */
+function openPicker({ title, addresses, preselected = [], min = 1, confirmLabel = 'Valider', allowRandom = false, onConfirm }) {
+  const selected = new Set(preselected);
+  const sorted = [...addresses].sort(byName);
+  let query = '';
+
+  $('#modal-body').innerHTML = `
+    <h2>${esc(title)}</h2>
+    <div class="form-group" style="margin-bottom:8px">
+      <input id="picker-search" type="search" placeholder="Rechercher un logement ou une rue…" autocomplete="off">
+    </div>
+    <div id="picker-count" class="picker-count"></div>
+    <div id="picker-list" class="picker-list"></div>
+    <div class="form-actions">
+      <button class="btn btn-secondary" id="picker-cancel">Annuler</button>
+      ${allowRandom ? '<button class="btn btn-secondary" id="picker-random">Au hasard</button>' : ''}
+      <button class="btn btn-primary" id="picker-ok">${esc(confirmLabel)}</button>
+    </div>`;
+
+  const list = $('#picker-list');
+  const draw = () => {
+    const shown = sorted.filter(a => matchesQuery(a, query));
+    list.innerHTML = shown.map(a => `
+      <label class="picker-row">
+        <input type="checkbox" data-pick="${a.id}" ${selected.has(a.id) ? 'checked' : ''}>
+        <span class="picker-text">
+          <span class="picker-name">${esc(a.name)}${a.toCheck ? ' <span class="tag surface">à vérifier</span>' : ''}</span>
+          <span class="picker-addr">${esc(a.address || '')}</span>
+        </span>
+      </label>`).join('') || '<div class="picker-count">Aucun logement ne correspond.</div>';
+    $('#picker-count').textContent = `${selected.size} sélectionné(s) · ${shown.length} affiché(s) sur ${sorted.length}`;
+    $('#picker-ok').disabled = selected.size < min;
+  };
+
+  list.addEventListener('change', (e) => {
+    const id = parseInt(e.target.dataset.pick, 10);
+    if (!Number.isFinite(id)) return;
+    if (e.target.checked) selected.add(id); else selected.delete(id);
+    $('#picker-count').textContent = `${selected.size} sélectionné(s)`;
+    $('#picker-ok').disabled = selected.size < min;
+  });
+  $('#picker-search').addEventListener('input', (e) => { query = e.target.value.trim(); draw(); });
+  $('#picker-cancel').addEventListener('click', closeModal);
+  $('#picker-ok').addEventListener('click', () => {
+    const ids = sorted.filter(a => selected.has(a.id)).map(a => a.id);
+    closeModal();
+    onConfirm(ids);
+  });
+  const randomBtn = $('#picker-random');
+  if (randomBtn) {
+    randomBtn.addEventListener('click', () => {
+      const count = Math.min(sorted.length, 3 + Math.floor(Math.random() * 3));
+      selected.clear();
+      [...sorted].sort(() => Math.random() - 0.5).slice(0, count).forEach(a => selected.add(a.id));
+      query = '';
+      $('#picker-search').value = '';
+      draw();
+    });
+  }
+
+  draw();
+  $('#address-modal').classList.add('active');
 }
 
 function switchView(name) {
@@ -186,7 +271,7 @@ async function renderDay() {
           : `<br>Parcours différents connus : ${orders.size}/3 avant les mélanges inédits.`}
       </div>
       <div class="section-actions">
-        <button class="btn btn-primary" id="btn-exercise" ${addresses.length < 3 ? 'disabled' : ''}>Nouvel exercice</button>
+        <button class="btn btn-primary" id="btn-exercise" ${addresses.length < 2 ? 'disabled' : ''}>Nouvel exercice — choisir les logements</button>
       </div>
       <div id="exercise-area"></div>
     </div>`;
@@ -227,12 +312,16 @@ function renderStopsList(stops) {
     const name = stop.address ? stop.address.name
       : stop.type === 'home' ? 'Domicile'
       : (stop.traccarAddress ? `Pause · ${stop.traccarAddress}` : 'Pause perso');
+    const ambiguous = stop.ambiguousWith && stop.ambiguousWith.length
+      ? `<div class="stop-time" style="color:var(--warning)">Même immeuble que ${esc(stop.ambiguousWith.join(', '))} — durée sur place non apprise</div>`
+      : '';
     html += `
       <div class="stop-item">
         <div class="stop-dot ${dotClass}"></div>
         <div class="stop-info">
           <div class="stop-name">${esc(name)}</div>
           <div class="stop-time">${formatTime(stop.arrivalTime)} — ${formatTime(stop.departureTime)}</div>
+          ${ambiguous}
         </div>
         <div class="stop-duration">${formatDuration(stop.duration)}</div>
       </div>`;
@@ -351,14 +440,28 @@ async function importFile(e) {
 // ---- EXERCICE MANUEL ----
 
 async function startExercise() {
+  const { addresses, selection } = await loadContext();
+  if (addresses.length < 2) { showToast('Il faut au moins 2 logements', 'error'); return; }
+
+  openPicker({
+    title: 'Logements de l\'exercice',
+    addresses,
+    preselected: selection,
+    min: 2,
+    allowRandom: true,
+    confirmLabel: 'Continuer',
+    onConfirm: ids => buildExercise(ids)
+  });
+}
+
+async function buildExercise(ids) {
   const { addresses, home } = await loadContext();
-  if (addresses.length < 3) { showToast('Il faut au moins 3 adresses', 'error'); return; }
+  const subset = addresses.filter(a => ids.includes(a.id));
+  if (subset.length < 2) return;
 
   const tours = await storage.getTours();
   const known = knownOrderKeys(tours);
-  const count = Math.min(addresses.length, 3 + Math.floor(Math.random() * 3));
 
-  let subset;
   let order;
   let mode;
 
@@ -366,13 +469,11 @@ async function startExercise() {
     mode = 'inédit';
     let attempts = 0;
     do {
-      subset = [...addresses].sort(() => Math.random() - 0.5).slice(0, count);
-      order = subset;
+      order = [...subset].sort(() => Math.random() - 0.5);
       attempts++;
     } while (known.has(order.map(a => a.id || a.name).join(',')) && attempts < 30);
   } else {
     mode = 'proposé';
-    subset = [...addresses].sort(() => Math.random() - 0.5).slice(0, count);
     const res = optimizer.optimize(subset, {
       startId: home ? 'home' : null,
       startCoords: home,
@@ -524,8 +625,23 @@ async function saveExercise() {
 
 // ---- PLAN ----
 
+async function chooseDayLogements() {
+  const { addresses, selection } = await loadContext();
+  openPicker({
+    title: 'Logements du jour',
+    addresses,
+    preselected: selection,
+    min: 0,
+    confirmLabel: 'Valider la tournée',
+    onConfirm: async (ids) => {
+      await setDaySelection(ids);
+      renderPlan();
+    }
+  });
+}
+
 async function renderPlan() {
-  const { addresses, home } = await loadContext();
+  const { addresses, home, selection } = await loadContext();
   const container = $('#plan-content');
   const stats = learner.getStats();
 
@@ -533,19 +649,38 @@ async function renderPlan() {
     container.innerHTML = `
       <div class="empty-state">
         <div class="icon">🗺️</div>
-        <div class="title">Pas encore d'adresses</div>
-        <div class="subtitle">Ajoutez des logements dans l'onglet Adresses</div>
+        <div class="title">Pas encore de logements</div>
+        <div class="subtitle">Importez vos logements BnB Cleaner dans l'onglet Adresses</div>
       </div>`;
     return;
   }
 
-  planResult = optimizer.optimize(addresses, {
+  const chosen = addresses.filter(a => selection.includes(a.id));
+  const dayHeader = `
+    <div class="setting-section">
+      <h3>Logements du jour</h3>
+      <div class="info-row">
+        <span class="label">${chosen.length ? chosen.map(a => esc(a.name)).join(' · ') : 'Aucun logement choisi pour aujourd\'hui'}</span>
+      </div>
+      <div class="section-actions">
+        <button class="btn btn-primary" id="btn-day-pick">${chosen.length ? `Modifier (${chosen.length})` : 'Choisir les logements'}</button>
+      </div>
+    </div>`;
+
+  if (chosen.length === 0) {
+    planResult = null;
+    container.innerHTML = dayHeader + `<div class="notice">Sélectionnez les logements à faire aujourd'hui : l'appli proposera l'ordre et indiquera les temps qu'elle connaît.</div>`;
+    $('#btn-day-pick').addEventListener('click', chooseDayLogements);
+    return;
+  }
+
+  planResult = optimizer.optimize(chosen, {
     startId: home ? 'home' : null,
     startCoords: home,
     departureTime: Date.now()
   });
 
-  let html = `
+  let html = dayHeader + `
     <div class="setting-section">
       <h3>Données réelles apprises</h3>
       <div class="info-row"><span class="label">Trajets connus</span><span class="value">${stats.travelPairs}</span></div>
@@ -626,6 +761,7 @@ async function renderPlan() {
     </div>`;
 
   container.innerHTML = html;
+  $('#btn-day-pick').addEventListener('click', chooseDayLogements);
   container.querySelectorAll('[data-step]').forEach(el => {
     el.addEventListener('click', () => openStepEditor(parseInt(el.dataset.step, 10)));
   });
@@ -728,22 +864,94 @@ function closeModal() {
 
 // ---- ADDRESSES ----
 
+let addressQuery = '';
+
 async function renderAddresses() {
   const { addresses, home } = await loadContext();
   const container = $('#address-list');
+
+  container.innerHTML = `
+    <label class="file-drop">
+      Importer les logements BnB Cleaner (.json)
+      <input id="logements-input" type="file" accept=".json,application/json">
+    </label>
+    ${addresses.length > 8 ? `
+    <div class="form-group" style="margin-bottom:4px">
+      <input id="address-search" type="search" placeholder="Rechercher un logement ou une rue…" value="${esc(addressQuery)}" autocomplete="off">
+    </div>` : ''}
+    <div id="address-cards" class="address-list"></div>`;
+
+  $('#logements-input').addEventListener('change', importLogementsFile);
+  const search = $('#address-search');
+  if (search) {
+    search.addEventListener('input', (e) => {
+      addressQuery = e.target.value.trim();
+      renderAddressCards(addresses, home);
+    });
+  }
+  renderAddressCards(addresses, home);
+}
+
+async function importLogementsFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const json = JSON.parse(await file.text());
+    const list = Array.isArray(json) ? json : json.logements;
+    if (!Array.isArray(list)) throw new Error('Fichier non reconnu : liste « logements » absente');
+
+    const existing = await storage.getAddresses();
+    const known = new Map(existing.map(a => [a.name.toLowerCase(), a]));
+    let added = 0, updated = 0, skipped = 0;
+
+    for (const l of list) {
+      if (!l.name || !Number.isFinite(l.lat) || !Number.isFinite(l.lon)) { skipped++; continue; }
+      const data = {
+        name: l.name, address: l.address || '', lat: l.lat, lon: l.lon,
+        source: 'bnbcleaner', toCheck: Boolean(l.toCheck), note: l.note || null
+      };
+      const prev = known.get(l.name.toLowerCase());
+      let id;
+      if (prev) {
+        data.id = prev.id;
+        await storage.updateAddress(data);
+        id = prev.id;
+        updated++;
+      } else {
+        id = await storage.addAddress(data);
+        added++;
+      }
+      if (Number.isFinite(l.sizeM2) && l.sizeM2 > 0) learner.setAddressMeta(id, { sizeM2: l.sizeM2 });
+    }
+
+    await storage.saveModel(learner.exportModel());
+    showToast(`${added} ajoutés · ${updated} mis à jour${skipped ? ` · ${skipped} ignorés (sans coordonnées)` : ''}`, 'success');
+    renderAddresses();
+  } catch (err) {
+    showToast(err.message || 'Fichier illisible', 'error');
+  } finally {
+    e.target.value = '';
+  }
+}
+
+function renderAddressCards(addresses, home) {
+  const container = $('#address-cards');
 
   if (addresses.length === 0 && !home) {
     container.innerHTML = `
       <div class="empty-state">
         <div class="icon">📍</div>
-        <div class="title">Aucune adresse</div>
-        <div class="subtitle">Ajoutez vos logements clients avec le bouton +</div>
+        <div class="title">Aucun logement</div>
+        <div class="subtitle">Importez le fichier des logements BnB Cleaner, ou ajoutez-en un avec le bouton +</div>
       </div>`;
     return;
   }
 
-  let html = '';
-  if (home) {
+  const shown = addresses.filter(a => matchesQuery(a, addressQuery)).sort(byName);
+  let html = addresses.length > 8
+    ? `<div class="picker-count">${shown.length} affiché(s) sur ${addresses.length} logements</div>`
+    : '';
+  if (home && !addressQuery) {
     html += `
       <div class="address-card">
         <div class="icon home-icon">🏠</div>
@@ -754,15 +962,16 @@ async function renderAddresses() {
       </div>`;
   }
 
-  for (const addr of addresses) {
+  for (const addr of shown) {
     const meta = learner.getAddressMeta(addr.id || addr.name);
     const extra = meta ? [meta.type, meta.sizeM2 ? `${meta.sizeM2} m²` : null].filter(Boolean).join(' · ') : '';
     html += `
       <div class="address-card">
         <div class="icon">🏢</div>
         <div class="address-details">
-          <div class="address-name">${esc(addr.name)}${extra ? ` <span class="tag">${esc(extra)}</span>` : ''}</div>
+          <div class="address-name">${esc(addr.name)}${extra ? ` <span class="tag">${esc(extra)}</span>` : ''}${addr.toCheck ? ' <span class="tag surface">à vérifier</span>' : ''}</div>
           <div class="address-text">${esc(addr.address || `${addr.lat.toFixed(4)}, ${addr.lon.toFixed(4)}`)}</div>
+          ${addr.note ? `<div class="address-note">${esc(addr.note)}</div>` : ''}
         </div>
         <div class="address-actions">
           <button class="btn-icon" data-edit="${addr.id}">✏️</button>
