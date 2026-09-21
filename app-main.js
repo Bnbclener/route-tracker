@@ -2,9 +2,6 @@ import { AddressMatcher } from './core/address-matcher.js';
 import { RouteLearner } from './core/learner.js';
 import { RouteOptimizer } from './core/optimizer.js';
 import { IndexedDBAdapter } from './core/storage-adapter.js';
-import {
-  TraccarClient, DEFAULT_TRACCAR_SERVER, dayRange, importKey, buildTourFromTraccar
-} from './core/traccar-adapter.js';
 import { buildTourFromFile } from './core/file-import.js';
 
 const storage = new IndexedDBAdapter();
@@ -202,48 +199,21 @@ function knownOrderKeys(tours) {
   return keys;
 }
 
-// ---- JOURNÉE : IMPORT TRACCAR + EXERCICE MANUEL ----
+// ---- JOURNÉE : IMPORT GPS + EXERCICE MANUEL ----
 
 async function renderDay() {
   const { addresses, home } = await loadContext();
-  const cfg = await storage.getSetting('traccar');
   const tours = await storage.getTours();
   const container = $('#track-content');
-  const configured = cfg && cfg.deviceId && (cfg.token || (cfg.email && cfg.password));
 
-  let html = `<div class="setting-section"><h3>Import Traccar</h3>`;
-
-  if (!configured) {
-    html += `
-      <div class="notice">
-        Le GPS est capturé par l'appli <strong>Traccar Client</strong> sur le téléphone.
-        Configurez le serveur, l'identifiant et l'appareil dans <strong>Réglages</strong>, puis revenez ici importer chaque journée.
-      </div>
-      <div class="section-actions">
-        <button class="btn btn-primary" id="btn-go-settings">Configurer Traccar</button>
-      </div>`;
-  } else {
-    html += `
-      <div class="info-row">
-        <span class="label">Appareil</span>
-        <span class="value">${esc(cfg.deviceName || cfg.deviceId)}</span>
-      </div>
-      <div class="form-group" style="margin-top:12px">
-        <label>Journée à importer</label>
-        <input id="import-date" type="date" value="${todayLocal()}" max="${todayLocal()}">
-      </div>
-      <div class="section-actions">
-        <button class="btn btn-primary" id="btn-import">Importer la journée</button>
-      </div>
-      <div id="import-status"></div>`;
-  }
-  html += `</div>
+  let html = `
     <div class="setting-section">
-      <h3>Import d'un fichier de trace</h3>
+      <h3>Importer une trace GPS</h3>
       <div class="notice">
-        Sans serveur : une appli qui enregistre la trace GPS sur le téléphone (ex. Open GPX Tracker sur iPhone),
-        puis partagez le fichier <strong>.gpx</strong> ici. Accepte aussi les JSON Traccar (positions ou arrêts).
-        Les arrêts sont recalculés à partir des points réels (immobile ≥ 3 min dans 50 m).
+        Enregistrez vos tournées avec une appli GPS sur le téléphone
+        (ex. <strong>Open GPX Tracker</strong> sur iPhone, gratuit).
+        À la fin de la journée, envoyez-vous le fichier <strong>.gpx</strong>,
+        puis importez-le ici. L'appli détecte vos arrêts et apprend les temps.
       </div>
       <label class="file-drop">
         Choisir un fichier .gpx ou .json
@@ -278,30 +248,9 @@ async function renderDay() {
 
   container.innerHTML = html;
 
-  const goSettings = $('#btn-go-settings');
-  if (goSettings) goSettings.addEventListener('click', () => switchView('settings'));
-  const importBtn = $('#btn-import');
-  if (importBtn) importBtn.addEventListener('click', importDay);
   const exBtn = $('#btn-exercise');
   if (exBtn) exBtn.addEventListener('click', startExercise);
   $('#file-input').addEventListener('change', importFile);
-
-  if (configured) showExistingImport(tours, cfg, $('#import-date').value);
-  const dateInput = $('#import-date');
-  if (dateInput) dateInput.addEventListener('change', () => showExistingImport(tours, cfg, dateInput.value));
-}
-
-function showExistingImport(tours, cfg, dateStr) {
-  const status = $('#import-status');
-  if (!status) return;
-  const key = importKey(cfg.deviceId, dateStr);
-  const existing = tours.find(t => t.importKey === key);
-  if (!existing) {
-    status.innerHTML = '';
-    return;
-  }
-  status.innerHTML = `<div class="notice ok">Journée déjà importée (${existing.stops.length} arrêts). Réimporter remplace l'enregistrement mais l'apprentissage précédent reste.</div>`
-    + renderStopsList(existing.stops);
 }
 
 function renderStopsList(stops) {
@@ -311,7 +260,7 @@ function renderStopsList(stops) {
     const dotClass = stop.type === 'client' ? 'client' : stop.type === 'home' ? 'home' : 'personal';
     const name = stop.address ? stop.address.name
       : stop.type === 'home' ? 'Domicile'
-      : (stop.traccarAddress ? `Pause · ${stop.traccarAddress}` : 'Pause perso');
+      : 'Pause perso';
     const ambiguous = stop.ambiguousWith && stop.ambiguousWith.length
       ? `<div class="stop-time" style="color:var(--warning)">Même immeuble que ${esc(stop.ambiguousWith.join(', '))} — durée sur place non apprise</div>`
       : '';
@@ -327,71 +276,6 @@ function renderStopsList(stops) {
       </div>`;
   }
   return html + '</div>';
-}
-
-async function importDay() {
-  const cfg = await storage.getSetting('traccar');
-  const dateStr = $('#import-date').value;
-  const status = $('#import-status');
-  const btn = $('#btn-import');
-  if (!dateStr) { showToast('Choisissez une date', 'error'); return; }
-
-  btn.disabled = true;
-  status.innerHTML = '<div class="notice">Lecture des rapports Traccar…</div>';
-
-  try {
-    await loadContext();
-    const client = new TraccarClient(cfg);
-    const { from, to } = dayRange(dateStr);
-    const [stops, trips] = await Promise.all([
-      client.getStops(cfg.deviceId, from, to),
-      client.getTrips(cfg.deviceId, from, to)
-    ]);
-
-    if ((!stops || stops.length === 0) && (!trips || trips.length === 0)) {
-      status.innerHTML = '<div class="notice">Aucun arrêt ni trajet enregistré par Traccar ce jour-là. Vérifiez que Traccar Client tournait sur le téléphone.</div>';
-      return;
-    }
-
-    const tour = buildTourFromTraccar(
-      { dateStr, deviceId: cfg.deviceId, deviceName: cfg.deviceName, stops: stops || [], trips: trips || [] },
-      (lat, lon) => matcher.classify(lat, lon)
-    );
-
-    const tours = await storage.getTours();
-    const existing = tours.find(t => t.importKey === tour.importKey);
-    if (existing) {
-      if (!confirm('Cette journée est déjà importée. Remplacer l\'enregistrement ?')) {
-        status.innerHTML = '';
-        return;
-      }
-      await storage.deleteTour(existing.id);
-    } else {
-      learner.learnFromTour(tour);
-      await storage.saveModel(learner.exportModel());
-    }
-
-    await storage.addTour(tour);
-
-    const clients = tour.stops.filter(s => s.type === 'client').length;
-    const personal = tour.stops.filter(s => s.type === 'personal').length;
-    status.innerHTML = `
-      <div class="notice ok">
-        Importé : ${tour.stops.length} arrêts (${clients} logements, ${personal} pauses),
-        ${tour.tripCount} trajets, ${(tour.distanceM / 1000).toFixed(1)} km.
-        ${existing ? 'Enregistrement remplacé, apprentissage inchangé.' : 'Apprentissage mis à jour.'}
-      </div>` + renderStopsList(tour.stops);
-    showToast('Journée importée', 'success');
-  } catch (e) {
-    status.innerHTML = `
-      <div class="notice error">
-        ${esc(e.message)}<br><br>
-        Si le message parle de CORS : le serveur Traccar refuse les appels depuis le navigateur.
-        Plan B sans serveur : exporter la journée depuis Traccar (Rapports → Arrêts → Export) et me la transmettre, on ajoutera l'import de fichier.
-      </div>`;
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 async function importFile(e) {
@@ -705,7 +589,7 @@ async function renderPlan() {
     </div>`;
 
   if (!planResult.complete) {
-    html += `<div class="notice">Les « ? » sont des données que l'appli n'a pas encore : importez des journées Traccar ou cliquez une étape pour saisir ce que vous savez.</div>`;
+    html += `<div class="notice">Les « ? » sont des données que l'appli n'a pas encore : importez un fichier GPS ou cliquez une étape pour saisir ce que vous savez.</div>`;
   }
 
   html += '<div class="stop-list"><h3>Ordre recommandé <span style="font-size:11px;color:var(--text-muted);font-weight:400">(cliquer pour corriger)</span></h3>';
@@ -756,7 +640,7 @@ async function renderPlan() {
 
   html += `</div>
     <div style="font-size:11px;color:var(--text-muted);margin-top:12px;padding:0 4px;line-height:1.7">
-      ${tag('measured')} GPS Traccar · ${tag('manual')} saisi par vous · ${tag('surface')} déduit de la surface (1,2 min/m²) · ${tag('unknown')} aucune donnée<br>
+      ${tag('measured')} GPS mesuré · ${tag('manual')} saisi par vous · ${tag('surface')} déduit de la surface (1,2 min/m²) · ${tag('unknown')} aucune donnée<br>
       ⚡ route signalée · ⚠️ route pénalisée par vos commentaires
     </div>`;
 
@@ -1205,7 +1089,7 @@ async function renderHistory() {
       <div class="empty-state">
         <div class="icon">📊</div>
         <div class="title">Aucune tournée</div>
-        <div class="subtitle">Importez une journée Traccar ou enregistrez un exercice</div>
+        <div class="subtitle">Importez un fichier GPS ou enregistrez un exercice</div>
       </div>`;
     return;
   }
@@ -1224,7 +1108,7 @@ async function renderHistory() {
       <div class="tour-card">
         <div class="tour-header">
           <div class="tour-date">${formatDate(tour.date)}</div>
-          <span class="tag ${esc(source)}">${source === 'traccar' ? 'GPS Traccar' : source === 'manuel' ? 'Exercice manuel' : source === 'fichier' ? `Fichier ${tour.fileKind === 'gpx' ? 'GPX' : 'JSON'}` : 'GPS'}</span>
+          <span class="tag ${esc(source)}">${source === 'traccar' ? 'GPS' : source === 'manuel' ? 'Exercice manuel' : source === 'fichier' ? `Fichier ${tour.fileKind === 'gpx' ? 'GPX' : 'JSON'}` : 'GPS'}</span>
         </div>
         <div class="tour-stats">
           <div class="tour-stat"><span class="label">Durée totale</span><span class="value">${formatDuration(totalTour)}</span></div>
@@ -1237,7 +1121,7 @@ async function renderHistory() {
       const dotClass = stop.type === 'client' ? 'client' : stop.type === 'home' ? 'home' : 'personal';
       const name = stop.address ? stop.address.name
         : stop.type === 'home' ? 'Domicile'
-        : (stop.traccarAddress || 'Pause perso');
+        : 'Pause perso';
       html += `
           <div class="tour-stop-row">
             <span class="time">${formatTime(stop.arrivalTime)}</span>
@@ -1270,7 +1154,6 @@ async function deleteTour(id) {
 
 async function renderSettings() {
   const home = await storage.getSetting('home');
-  const cfg = (await storage.getSetting('traccar')) || {};
   const container = $('#settings-content');
 
   container.innerHTML = `
@@ -1286,44 +1169,13 @@ async function renderSettings() {
     </div>
 
     <div class="setting-section">
-      <h3>Traccar (source GPS)</h3>
+      <h3>Source GPS</h3>
       <div class="notice">
-        1. Installez <strong>Traccar Client</strong> sur le téléphone (App Store / Play Store).<br>
-        2. Créez un compte sur le serveur (démo gratuite : demo.traccar.org, historique non garanti).<br>
-        3. Dans le site Traccar, ajoutez l'appareil avec l'identifiant affiché dans l'appli.<br>
-        4. Générez un token : Traccar → Compte → Token (recommandé, évite de stocker le mot de passe ici).
+        Installez <strong>Open GPX Tracker</strong> (gratuit) sur votre iPhone.<br>
+        Lancez-le au début de votre tournée, arrêtez-le à la fin.<br>
+        Envoyez-vous le fichier .gpx, puis importez-le dans l'onglet <strong>Journée</strong>.
       </div>
-      <div class="form-group">
-        <label>URL du serveur</label>
-        <input id="tr-server" type="url" value="${esc(cfg.serverUrl || DEFAULT_TRACCAR_SERVER)}" placeholder="${DEFAULT_TRACCAR_SERVER}">
-      </div>
-      <div class="form-group">
-        <label>Token API (recommandé)</label>
-        <input id="tr-token" type="text" value="${esc(cfg.token || '')}" placeholder="Collez le token Traccar" autocomplete="off">
-      </div>
-      <div class="form-group">
-        <label>Ou e-mail du compte Traccar</label>
-        <input id="tr-email" type="email" value="${esc(cfg.email || '')}" placeholder="vous@exemple.fr" autocomplete="off">
-      </div>
-      <div class="form-group">
-        <label>Mot de passe Traccar (stocké sur cet appareil uniquement)</label>
-        <input id="tr-password" type="password" value="${esc(cfg.password || '')}" autocomplete="off">
-      </div>
-      <div class="section-actions">
-        <button class="btn btn-secondary" id="btn-tr-test">Tester et lister les appareils</button>
-      </div>
-      <div id="tr-devices">
-        ${cfg.deviceId ? `<div class="info-row"><span class="label">Appareil enregistré</span><span class="value">${esc(cfg.deviceName || cfg.deviceId)}</span></div>` : ''}
-      </div>
-      <div class="section-actions">
-        <button class="btn btn-primary" id="btn-tr-save">Enregistrer Traccar</button>
-      </div>
-    </div>
-
-    <div class="setting-section">
-      <h3>Détection des arrêts</h3>
-      <div class="setting-row"><span class="setting-label">Calculée par</span><span class="setting-value">serveur Traccar</span></div>
-      <div class="setting-row"><span class="setting-label">Arrêt = immobile</span><span class="setting-value">≥ 180 s (défaut serveur)</span></div>
+      <div class="setting-row"><span class="setting-label">Arrêt détecté si immobile</span><span class="setting-value">≥ 3 min dans 50 m</span></div>
       <div class="setting-row"><span class="setting-label">Rayon logement</span><span class="setting-value">50 m</span></div>
       <div class="setting-row"><span class="setting-label">Rayon domicile</span><span class="setting-value">80 m</span></div>
     </div>
@@ -1355,59 +1207,8 @@ async function renderSettings() {
   $('#btn-set-home').addEventListener('click', setHomeGPS);
   $('#btn-export').addEventListener('click', exportData);
   $('#btn-clear').addEventListener('click', clearAllData);
-  $('#btn-tr-test').addEventListener('click', testTraccar);
-  $('#btn-tr-save').addEventListener('click', () => saveTraccar(cfg));
 }
 
-function readTraccarForm() {
-  return {
-    serverUrl: ($('#tr-server').value.trim() || DEFAULT_TRACCAR_SERVER),
-    token: $('#tr-token').value.trim() || null,
-    email: $('#tr-email').value.trim() || null,
-    password: $('#tr-password').value || null
-  };
-}
-
-async function testTraccar() {
-  const form = readTraccarForm();
-  const box = $('#tr-devices');
-  const client = new TraccarClient(form);
-  if (!client.hasCredentials()) { showToast('Token ou e-mail + mot de passe requis', 'error'); return; }
-
-  box.innerHTML = '<div class="notice">Connexion…</div>';
-  try {
-    const devices = await client.getDevices();
-    if (!devices.length) {
-      box.innerHTML = '<div class="notice">Connexion OK mais aucun appareil sur ce compte. Ajoutez le téléphone dans Traccar avec l\'identifiant de l\'appli.</div>';
-      return;
-    }
-    const saved = (await storage.getSetting('traccar')) || {};
-    box.innerHTML = `
-      <div class="notice ok">Connexion OK — ${devices.length} appareil(s)</div>
-      <div class="form-group">
-        <label>Appareil à suivre</label>
-        <select id="tr-device" class="input">
-          ${devices.map(d => `<option value="${d.id}" data-name="${esc(d.name)}" ${String(saved.deviceId) === String(d.id) ? 'selected' : ''}>${esc(d.name)} (${esc(d.uniqueId)})</option>`).join('')}
-        </select>
-      </div>`;
-  } catch (e) {
-    box.innerHTML = `<div class="notice error">${esc(e.message)}</div>`;
-  }
-}
-
-async function saveTraccar(previous) {
-  const form = readTraccarForm();
-  const select = $('#tr-device');
-  const cfg = { ...previous, ...form };
-  if (select) {
-    cfg.deviceId = parseInt(select.value, 10);
-    cfg.deviceName = select.selectedOptions[0].dataset.name;
-  }
-  if (cfg.token) { cfg.email = null; cfg.password = null; }
-  await storage.setSetting('traccar', cfg);
-  showToast(cfg.deviceId ? 'Traccar enregistré' : 'Enregistré — testez pour choisir l\'appareil', 'success');
-  renderSettings();
-}
 
 async function setHomeGPS() {
   try {
