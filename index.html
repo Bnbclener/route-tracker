@@ -89,6 +89,18 @@
     </button>
   </nav>
 
+  <!-- Écran d'accès -->
+  <div id="lock-screen" class="lock-screen">
+    <div class="lock-box">
+      <img src="icon-192.png" alt="" width="72" height="72" class="lock-icon">
+      <h2>BnB Route Tracker</h2>
+      <p>Mot de passe d'accès</p>
+      <input id="lock-password" type="password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Mot de passe">
+      <div id="lock-status" class="lock-status"></div>
+      <button id="lock-submit" class="btn btn-primary">Ouvrir</button>
+    </div>
+  </div>
+
   <!-- Modal (logement ou correction d'étape) -->
   <div id="address-modal" class="modal-overlay">
     <div class="modal" id="modal-body" style="max-height:88vh;overflow-y:auto"></div>

@@ -871,8 +871,8 @@ async function renderAddresses() {
   const container = $('#address-list');
 
   container.innerHTML = `
-    <label class="file-drop">
-      Importer les logements BnB Cleaner (.json)
+    <label class="file-drop" style="margin-top:0">
+      Importer un fichier de logements (.json)
       <input id="logements-input" type="file" accept=".json,application/json">
     </label>
     ${addresses.length > 8 ? `
@@ -896,7 +896,115 @@ async function importLogementsFile(e) {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
   try {
-    const json = JSON.parse(await file.text());
+    await importLogementsJson(JSON.parse(await file.text()));
+  } catch (err) {
+    showToast(err.message || 'Fichier illisible', 'error');
+  } finally {
+    e.target.value = '';
+  }
+}
+
+function fromBase64(s) {
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+
+// ---- ACCÈS PAR MOT DE PASSE ----
+// Les logements sont publiés chiffrés (AES-256-GCM, clé dérivée du mot de passe par PBKDF2).
+// Le bon mot de passe ouvre l'appli ET déchiffre les logements, qui s'affichent tout seuls.
+
+function normalizePassword(text) {
+  return String(text || '').toLowerCase().normalize('NFD').replace(/[^a-z0-9]/g, '');
+}
+
+function toBase64(bytes) {
+  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
+}
+
+async function pbkdf2Bits(password, saltBytes, iterations) {
+  const material = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  return crypto.subtle.deriveBits({ name: 'PBKDF2', salt: saltBytes, iterations, hash: 'SHA-256' }, material, 256);
+}
+
+async function decryptLogements(password, payload) {
+  const bits = await pbkdf2Bits(password, fromBase64(payload.salt), payload.iter);
+  const key = await crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['decrypt']);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(payload.iv) }, key, fromBase64(payload.data));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+async function tryUnlock(typed) {
+  const password = normalizePassword(typed);
+  if (!password) throw new Error('Saisissez le mot de passe');
+
+  let payload = null;
+  try {
+    const res = await fetch('./logements.enc.json', { cache: 'no-cache' });
+    if (res.ok) payload = await res.json();
+  } catch { /* hors ligne */ }
+
+  const access = (await storage.getSetting('access')) || {};
+
+  if (payload) {
+    let json;
+    try {
+      json = await decryptLogements(password, payload);
+    } catch {
+      throw new Error('Mot de passe incorrect');
+    }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const check = await pbkdf2Bits(password, salt, 200000);
+    await storage.setSetting('access', { unlocked: true, salt: toBase64(salt), check: toBase64(check) });
+    await importLogementsJson(json, { silent: true });
+    return json.logements ? json.logements.length : 0;
+  }
+
+  if (access.check) {
+    const check = await pbkdf2Bits(password, fromBase64(access.salt), 200000);
+    if (toBase64(check) !== access.check) throw new Error('Mot de passe incorrect');
+    await storage.setSetting('access', { ...access, unlocked: true });
+    return null;
+  }
+
+  throw new Error('Connexion internet nécessaire pour la première ouverture');
+}
+
+function showLock() {
+  const lock = $('#lock-screen');
+  lock.classList.add('active');
+  const input = $('#lock-password');
+  const status = $('#lock-status');
+  const btn = $('#lock-submit');
+
+  const submit = async () => {
+    btn.disabled = true;
+    status.textContent = 'Vérification…';
+    status.className = 'lock-status';
+    try {
+      const count = await tryUnlock(input.value);
+      lock.classList.remove('active');
+      input.value = '';
+      startApp();
+      if (count) showToast(`${count} logements chargés`, 'success');
+    } catch (err) {
+      status.textContent = err.message;
+      status.className = 'lock-status error';
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  btn.onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
+
+async function lockApp() {
+  const access = (await storage.getSetting('access')) || {};
+  await storage.setSetting('access', { ...access, unlocked: false });
+  location.reload();
+}
+
+async function importLogementsJson(json, { silent = false } = {}) {
+  {
     const list = Array.isArray(json) ? json : json.logements;
     if (!Array.isArray(list)) throw new Error('Fichier non reconnu : liste « logements » absente');
 
@@ -925,12 +1033,9 @@ async function importLogementsFile(e) {
     }
 
     await storage.saveModel(learner.exportModel());
+    if (silent) return;
     showToast(`${added} ajoutés · ${updated} mis à jour${skipped ? ` · ${skipped} ignorés (sans coordonnées)` : ''}`, 'success');
     renderAddresses();
-  } catch (err) {
-    showToast(err.message || 'Fichier illisible', 'error');
-  } finally {
-    e.target.value = '';
   }
 }
 
@@ -1233,8 +1338,20 @@ async function renderSettings() {
         <span class="setting-label" style="color:var(--danger)">Effacer toutes les données</span>
         <span class="setting-value">⚠️</span>
       </div>
+    </div>
+
+    <div class="setting-section">
+      <h3>Accès</h3>
+      <div class="setting-row" style="cursor:pointer" id="btn-lock">
+        <div>
+          <div class="setting-label">Verrouiller l'appli</div>
+          <div class="coords-display">Redemande le mot de passe et recharge la liste des logements</div>
+        </div>
+        <span class="setting-value">🔒</span>
+      </div>
     </div>`;
 
+  $('#btn-lock').addEventListener('click', lockApp);
   $('#btn-set-home').addEventListener('click', setHomeGPS);
   $('#btn-export').addEventListener('click', exportData);
   $('#btn-clear').addEventListener('click', clearAllData);
@@ -1342,7 +1459,31 @@ async function clearAllData() {
 
 // ---- INIT ----
 
-document.addEventListener('DOMContentLoaded', () => {
+// iPhone, appli installée : la fenêtre annoncée peut être plus courte que l'écran
+// (barre d'état translucide). On donne au corps la vraie hauteur de l'écran.
+function fitAppHeight() {
+  const root = document.documentElement.style;
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  if (standalone && /iPhone|iPod/.test(navigator.userAgent)) {
+    const portrait = matchMedia('(orientation: portrait)').matches;
+    const full = portrait ? Math.max(screen.height, screen.width) : Math.min(screen.height, screen.width);
+    if (full > window.innerHeight) {
+      root.setProperty('--app-h', `${full}px`);
+      return;
+    }
+  }
+  root.removeProperty('--app-h'); // partout ailleurs : la hauteur CSS (100dvh) suffit
+}
+fitAppHeight();
+window.addEventListener('resize', fitAppHeight);
+window.addEventListener('orientationchange', () => setTimeout(fitAppHeight, 300));
+
+let appStarted = false;
+
+function startApp() {
+  if (appStarted) return;
+  appStarted = true;
+
   $$('.nav-btn').forEach(btn => {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
@@ -1353,8 +1494,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   switchView('track');
+}
 
+document.addEventListener('DOMContentLoaded', async () => {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
+
+  const access = await storage.getSetting('access');
+  if (access && access.unlocked) startApp();
+  else showLock();
 });

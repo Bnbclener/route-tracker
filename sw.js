@@ -1,4 +1,4 @@
-const CACHE_NAME = 'route-tracker-v7';
+const CACHE_NAME = 'route-tracker-v9';
 const ASSETS = [
   './',
   './index.html',
@@ -19,9 +19,7 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(
-    caches.open(CACHE_NAME).then(cache => cache.addAll(ASSETS))
-  );
+  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(ASSETS)));
   self.skipWaiting();
 });
 
@@ -34,10 +32,21 @@ self.addEventListener('activate', (e) => {
   self.clients.claim();
 });
 
+// Réseau d'abord : une nouvelle version publiée s'affiche dès l'ouverture suivante.
+// Hors ligne (ou réseau en panne) : on sert la copie en cache.
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  if (url.origin !== self.location.origin) return;
+  if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
+
   e.respondWith(
-    caches.match(e.request).then(cached => cached || fetch(e.request))
+    fetch(e.request, { cache: 'no-cache' })
+      .then(res => {
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(e.request, copy));
+        }
+        return res;
+      })
+      .catch(() => caches.match(e.request, { ignoreSearch: true }))
   );
 });

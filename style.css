@@ -29,11 +29,18 @@ html, body {
   overflow: hidden;
   -webkit-text-size-adjust: 100%;
 }
+/* iOS, appli installée + barre d'état translucide : la zone de mise en page est plus courte
+   que l'écran et tout élément « fixed » en bas flotte trop haut. On allonge html, on donne
+   au corps la hauteur réelle de l'écran (--app-h, posée par le script) et la barre de
+   navigation devient un simple bloc en bas du corps, plus jamais « fixed ». */
+html { min-height: calc(100% + env(safe-area-inset-top)); }
 body {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
+  height: var(--app-h, 100dvh);
   user-select: none;
   -webkit-user-select: none;
 }
@@ -54,17 +61,16 @@ input, textarea, select {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 16px;
-  padding-bottom: calc(96px + var(--safe-bottom));
+  padding-bottom: 96px;
   -webkit-overflow-scrolling: touch;
 }
 .view.active { display: flex; }
 
 /* Bottom nav */
 .bottom-nav {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  position: relative;
+  flex-shrink: 0;
+  width: 100%;
   display: flex;
   background: var(--bg-card);
   border-top: 1px solid var(--border);
@@ -314,6 +320,46 @@ input, textarea, select {
 }
 .file-drop input { display: none; }
 
+/* Écran d'accès */
+.lock-screen {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 500;
+  background: var(--bg);
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  padding-top: max(24px, env(safe-area-inset-top));
+}
+.lock-screen.active { display: flex; }
+.lock-box {
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+.lock-icon { border-radius: 18px; }
+.lock-box h2 { font-size: 20px; font-weight: 700; }
+.lock-box p { font-size: 13px; color: var(--text-muted); }
+.lock-box input {
+  width: 100%;
+  padding: 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  text-align: center;
+  outline: none;
+}
+.lock-box input:focus { border-color: var(--accent); }
+.lock-box .btn { width: 100%; flex: none; }
+.lock-status { min-height: 18px; font-size: 13px; color: var(--text-muted); }
+.lock-status.error { color: var(--danger); }
+
 /* Sélecteur de logements */
 .picker-count {
   font-size: 12px;
@@ -418,7 +464,7 @@ input[type="date"], input[type="time"] { color-scheme: dark; min-height: 48px; }
 
 /* Add button */
 .fab {
-  position: fixed;
+  position: absolute;
   bottom: calc(80px + var(--safe-bottom));
   right: 16px;
   width: 56px;
@@ -440,7 +486,7 @@ input[type="date"], input[type="time"] { color-scheme: dark; min-height: 48px; }
 /* Modal */
 .modal-overlay {
   display: none;
-  position: fixed;
+  position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.6);
   z-index: 200;
